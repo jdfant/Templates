@@ -1,0 +1,198 @@
+name: OPENTOFU WORKFLOW
+
+on:
+  workflow_call:
+    inputs:
+      GITHUB_RUNNER:
+        description: 'Name of GitHub-hosted runner or self-hosted runner'
+        default: 'ubuntu-latest'
+        required: false
+        type: string
+      OPENTOFU_VERSION:
+        description: 'OpenTofu version used inside github action'
+        default: '~1.7.2'
+        required: false
+        type: string
+      WORK_DIR:
+        description: 'A relative path starting with "." that OpenTofu will execute within (e.g. "./workdir")'
+        default: '.'
+        required: false
+        type: string
+      AWS_REGION:
+        description: 'The AWS region to deploy resources'
+        default: ''
+        required: false
+        type: string
+      ACCT_NUM:
+        description: The number of the AWS account
+        required: true
+        type: string
+      ACCT_NAME:
+        description: The name of the AWS account
+        required: true
+        type: string
+      CONCURRENCY_GROUP:
+        description: 'Name of concurrency group to manage concurrent github action runs'
+        default: ${{ github.repository }}/${{ github.event.pull_request.head.ref || github.ref }}/${{ inputs.WORK_DIR }}
+        required: false
+        type: string
+
+# Only one workflow runs at a time
+concurrency:
+   group: ${{ inputs.CONCURRENCY_GROUP }}
+   cancel-in-progress: true
+
+jobs:
+  opentofu-run:
+    runs-on: ${{ inputs.GITHUB_RUNNER }}
+    permissions:
+      contents: write # This is required for actions/checkout
+      id-token: write # This is required for requesting the JWT
+      pull-requests: write # This is required for commenting on PRs
+    env:
+      account_name: ${{ inputs.ACCT_NAME }}
+      account_number: ${{ inputs.ACCT_NUM }}
+      github-token: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      init_status: ${{ steps.init.outcome }}
+      plan_status: ${{ steps.plan.outputs.exitcode == '1' || steps.plan.outcome }}
+      apply_status: ${{ steps.apply.outputs.exitcode == '1' || steps.apply.outcome }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: "arn:aws:iam::${{ inputs.ACCT_NUM }}:role/${{ inputs.ACCT_NAME }}-github-service-role"
+          aws-region: ${{ inputs.AWS_REGION }}
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+      
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          opentofu_version: ${{ inputs.opentofu_VERSION }}
+
+      - name: OpenTofu Fmt
+        id: fmt
+        shell: bash
+        working-directory: ${{ inputs.WORK_DIR }}
+        run: tofu fmt
+    
+      - name: Auto Commit Changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "OpenTofu fmt"
+          file_pattern: "*.tf"
+          commit_user_name: "github-actions[bot]"
+
+      - name: OpenTofu Init
+        id: init
+        working-directory: ${{ inputs.WORK_DIR }}
+        shell: bash
+        run: tofu init -no-color -input=false
+
+      - name: OpenTofu Validate
+        id: validate
+        shell: bash
+        working-directory: ${{ inputs.WORK_DIR }}
+        run: tofu validate -no-color
+
+      - name: OpenTofu Plan
+        id: plan
+        working-directory: ${{ inputs.WORK_DIR }}
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: tofu plan -no-color -input=false -detailed-exitcode
+        continue-on-error: true
+
+      - uses: actions/github-script@v7
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          PLAN: "opentofu\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Retrieve existing bot comments for the PR
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes('OpenTofu Format and Style')
+            })
+
+            // Prepare format of the comment
+            const output = `#### OpenTofu Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### OpenTofu Initialization ⚙️\`${{ steps.init.outcome }}\`
+            <details><summary>Initialization Output</summary>
+
+            \`\`\`\n
+            ${{ steps.init.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            #### OpenTofu Validation 🤖\`${{ steps.validate.outcome }}\`
+            <details><summary>Validation Output</summary>
+
+            \`\`\`\n
+            ${{ steps.validate.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            #### OpenTofu Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ inputs.WORK_DIR }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+            // If a comment does exist, update it, otherwise create a new one
+            if (botComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              })
+            } else {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+            }
+
+      - name: OpenTofu Apply
+        id: apply
+        working-directory: ${{ inputs.WORK_DIR }}
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        shell: bash
+        run: tofu apply -no-color -auto-approve -input=false
+        continue-on-error: true
+
+      - name: OpenTofu Init Outcome
+        if: steps.init.outcome == 'failure'
+        shell: bash
+        run: exit 1
+
+      - name: OpenTofu Plan Outcome
+        if: ${{ steps.plan.outcome == 'failure' || steps.plan.outputs.exitcode == '1' }}
+        shell: bash
+        run: exit 1
+
+      - name: OpenTofu Apply Outcome
+        if: ${{ steps.apply.outcome == 'failure' || steps.apply.outputs.exitcode == '1' }}
+        shell: bash
+        run: exit 1

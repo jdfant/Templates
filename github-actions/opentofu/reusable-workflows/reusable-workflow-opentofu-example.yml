@@ -1,0 +1,64 @@
+name: reusable workflow test
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - stg
+    paths:
+      - "opentofu/**"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "opentofu/**"
+
+jobs:
+  call-workflow:
+    name: "Detect Changes"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # This is required for actions/checkout
+      id-token: write # This is required for requesting the JWT
+      pull-requests: write # This is required for commenting on PRs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            dev:
+              - 'opentofu/dev/**'
+            stg:
+              - 'opentofu/stg/**'
+    outputs:
+      dev: ${{ steps.changes.outputs.dev }}
+      stg: ${{ steps.changes.outputs.stg }}
+
+  opentofu_for_dev:
+    name: "OpenTofu job for Development branch"
+    needs: call-workflow
+    if: ${{ needs.call-workflow.outputs.dev == 'true' }}
+    # Not a real github repo path
+    uses: jdfant/opentofu/.github/workflows/opentofu-workflow.yml@main
+    with:
+      AWS_REGION: 'us-west-1'
+      ACCT_NUM: '012345678910'
+      ACCT_NAME: 'opentofu-test-account'
+      WORK_DIR: 'opentofu/dev'
+
+  opentofu_for_stg:
+    name: "OpenTofu job for Stage branch"
+    needs: call-workflow
+    if: ${{ needs.call-workflow.outputs.stg == 'true' }}
+    # Not a real github repo path
+    uses: jdfant/opentofu/.github/workflows/opentofu-workflow.yml@main
+    with:
+      AWS_REGION: 'us-west-2'
+      ACCT_NUM: '012345678910'
+      ACCT_NAME: 'opentofu-test-account'
+      WORK_DIR: 'opentofu/stg'
